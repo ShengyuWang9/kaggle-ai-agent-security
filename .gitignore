@@ -1,0 +1,24 @@
+# Virtual Environment
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+
+# Outputs
+outputs/
+
+# OS
+Thumbs.db
+.DS_Store
