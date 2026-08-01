@@ -22,3 +22,12 @@ outputs/
 # OS
 Thumbs.db
 .DS_Store
+
+# AIComp local history
+.aicomp/
+
+# Local evaluation artifacts
+evaluation_artifacts/
+
+# Temporary files
+*.log
