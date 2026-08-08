@@ -75,7 +75,7 @@ Phase 5.6.2 只统一实验配置和日志元数据，不修改 H1-H8、攻击�
 | `probe_set` | 声明的 probe 集合 | 空 tuple |
 | `environment` | 执行环境标签 | 本地为 `local`，否则 `unknown` |
 
-`probe_set` 在本阶段只进入统一配置，不改变 H1-H8 的执行逻辑。Phase 5.6.3 快速模式再使用它限制 probe 数量。
+`probe_set` 不改变 H1-H8 内容。Phase 5.6.3 的 `phase5_6_lightweight` 模式使用它选择已有 probe 子集；其他模式保持原有执行逻辑。
 
 ### 3.1 Python mapping 入口
 
@@ -170,7 +170,7 @@ os.environ["AICOMP_EXPERIMENT_ENVIRONMENT"] = "kaggle_gym"
 
 - `AttackRunConfig.time_budget_s` 继续控制真实运行时预算；
 - `AttackRunConfig.max_steps` 和 `max_tool_hops` 不变；
-- `run()` 开始时，日志配置中的 `budget_s` 更新为实际 `time_budget_s`；
+- `run()` 开始时，实际预算取声明 `budget_s` 与 `time_budget_s` 的较小值；声明值为 0 时沿用 evaluator 预算；
 - trace 中存在 seed 时，记录使用实际 trace seed；否则使用声明 seed。
 
 因此实验元数据不会改变 evaluator 的时间和工具调用约束。

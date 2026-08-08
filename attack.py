@@ -51,6 +51,14 @@ AGENT_TYPE_ENV_VARS: Final[tuple[str, ...]] = (
 )
 EXPERIMENT_MODE_ENV_VAR: Final[str] = "AICOMP_ATTACK_EXPERIMENT_MODE"
 PHASE52_RECORDS_FILENAME: Final[str] = "phase5_2_records.jsonl"
+PHASE56_RECORDS_FILENAME: Final[str] = "phase5_6_llm_records.jsonl"
+PHASE56_LIGHTWEIGHT_MODE: Final[str] = "phase5_6_lightweight"
+PHASE56_LIGHTWEIGHT_DEFAULT_PROBES: Final[tuple[str, ...]] = ("H1_URL",)
+PHASE56_LIGHTWEIGHT_MAX_BUDGET_S: Final[float] = 120.0
+EXPERIMENT_LOGGING_MODES: Final[set[str]] = {
+    "phase5_2_only",
+    PHASE56_LIGHTWEIGHT_MODE,
+}
 EXPERIMENT_BACKEND_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_BACKEND"
 EXPERIMENT_MODEL_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_MODEL"
 EXPERIMENT_AGENT_TYPE_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_AGENT_TYPE"
@@ -187,10 +195,15 @@ class ExperimentConfig:
         )
 
     def with_runtime_budget(self, budget_s: float) -> "ExperimentConfig":
-        resolved = float(budget_s)
-        if not math.isfinite(resolved) or resolved <= 0:
+        evaluator_budget = float(budget_s)
+        if not math.isfinite(evaluator_budget) or evaluator_budget <= 0:
             raise ValueError("runtime budget_s must be finite and greater than zero")
-        return replace(self, budget_s=resolved)
+        effective_budget = (
+            min(self.budget_s, evaluator_budget)
+            if self.budget_s > 0
+            else evaluator_budget
+        )
+        return replace(self, budget_s=effective_budget)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -417,9 +430,18 @@ PHASE52_ONLY_VERIFICATION_SPECS: Final[tuple[VerificationSpec, ...]] = (
 class AttackState:
     """运行状态：时间预算 + 统计计数。"""
 
-    def __init__(self, config: AttackRunConfig) -> None:
+    def __init__(
+        self,
+        config: AttackRunConfig,
+        *,
+        effective_budget_s: float | None = None,
+    ) -> None:
         self._start = time.time()
-        self.budget_s = float(config.time_budget_s)
+        self.budget_s = float(
+            config.time_budget_s
+            if effective_budget_s is None
+            else effective_budget_s
+        )
         self.max_tool_hops = int(config.max_tool_hops)
         self.max_steps = int(config.max_steps)
         self.chains_tried = 0
@@ -832,21 +854,33 @@ def _tool_sequence(events: list[dict]) -> list[dict[str, Any]]:
     ]
 
 
-def _phase52_record_file_path() -> str:
+def _experiment_record_file_path(experiment_mode: str) -> str:
+    filename = (
+        PHASE56_RECORDS_FILENAME
+        if experiment_mode == PHASE56_LIGHTWEIGHT_MODE
+        else PHASE52_RECORDS_FILENAME
+    )
     if os.path.isdir("/kaggle/working"):
-        return os.path.join("/kaggle/working", PHASE52_RECORDS_FILENAME)
-    return f"./{PHASE52_RECORDS_FILENAME}"
+        return os.path.join("/kaggle/working", filename)
+    return f"./{filename}"
 
 
-def _phase52_file_logging_enabled() -> bool:
-    return os.getenv(EXPERIMENT_MODE_ENV_VAR, "").strip().lower() == "phase5_2_only"
+def _experiment_file_logging_enabled(experiment_mode: str) -> bool:
+    return experiment_mode in EXPERIMENT_LOGGING_MODES
 
 
-def _write_experiment_record(record_dict: dict[str, Any]) -> None:
-    if not _phase52_file_logging_enabled():
+def _write_experiment_record(
+    record_dict: dict[str, Any],
+    experiment_mode: str,
+) -> None:
+    if not _experiment_file_logging_enabled(experiment_mode):
         return
     try:
-        with open(_phase52_record_file_path(), "a", encoding="utf-8") as fh:
+        with open(
+            _experiment_record_file_path(experiment_mode),
+            "a",
+            encoding="utf-8",
+        ) as fh:
             fh.write(json.dumps(record_dict, ensure_ascii=False, sort_keys=True))
             fh.write("\n")
     except Exception:
@@ -1457,18 +1491,51 @@ class AttackAlgorithm(AttackAlgorithmBase):
             or os.getenv(EXPERIMENT_MODE_ENV_VAR)
             or default_mode
         ).lower()
-        self._log_records = self._experiment_mode == "phase5_2_only"
+        self._log_records = self._experiment_mode in EXPERIMENT_LOGGING_MODES
         self.prompt_generator = PromptGenerator(profile=profile)
         self.chain_builder = ChainBuilder()
         self.trace_analyzer = TraceAnalyzer()
 
     def _phase52_specs(self) -> tuple[VerificationSpec, ...]:
+        all_specs = PHASE52_BASE_VERIFICATION_SPECS + PHASE52_ONLY_VERIFICATION_SPECS
         if self._experiment_mode == "phase5_2_only":
-            return PHASE52_BASE_VERIFICATION_SPECS + PHASE52_ONLY_VERIFICATION_SPECS
+            return all_specs
+        if self._experiment_mode == PHASE56_LIGHTWEIGHT_MODE:
+            requested = (
+                self._experiment_config.probe_set
+                or PHASE56_LIGHTWEIGHT_DEFAULT_PROBES
+            )
+            known = {spec.experiment_id for spec in all_specs}
+            unknown = [probe for probe in requested if probe not in known]
+            if unknown:
+                raise ValueError(
+                    "unknown Phase 5.6 lightweight probes: " + ", ".join(unknown)
+                )
+            requested_set = set(requested)
+            return tuple(
+                spec for spec in all_specs if spec.experiment_id in requested_set
+            )
         return ()
 
     def _template_search_enabled(self) -> bool:
-        return self._experiment_mode != "phase5_2_only"
+        return self._experiment_mode not in EXPERIMENT_LOGGING_MODES
+
+    def _runtime_experiment_config(
+        self,
+        evaluator_budget_s: float,
+    ) -> ExperimentConfig:
+        experiment_config = self._experiment_config
+        if self._experiment_mode == PHASE56_LIGHTWEIGHT_MODE:
+            requested_budget = (
+                experiment_config.budget_s
+                if experiment_config.budget_s > 0
+                else PHASE56_LIGHTWEIGHT_MAX_BUDGET_S
+            )
+            experiment_config = replace(
+                experiment_config,
+                budget_s=min(requested_budget, PHASE56_LIGHTWEIGHT_MAX_BUDGET_S),
+            )
+        return experiment_config.with_runtime_budget(evaluator_budget_s)
 
     def _default_search_plan(self) -> list[CandidatePlan]:
         """Build a bounded, replayable search plan from the existing prompt banks.
@@ -1686,7 +1753,7 @@ class AttackAlgorithm(AttackAlgorithmBase):
             + json.dumps(record_dict, ensure_ascii=False, sort_keys=True),
             flush=True,
         )
-        _write_experiment_record(record_dict)
+        _write_experiment_record(record_dict, self._experiment_mode)
 
     def _make_record(
         self,
@@ -1882,10 +1949,13 @@ class AttackAlgorithm(AttackAlgorithmBase):
             self._emit_record(record)
 
     def run(self, env, config: AttackRunConfig) -> list[AttackCandidate]:
-        self._active_experiment_config = self._experiment_config.with_runtime_budget(
+        self._active_experiment_config = self._runtime_experiment_config(
             config.time_budget_s
         )
-        state = AttackState(config)
+        state = AttackState(
+            config,
+            effective_budget_s=self._active_experiment_config.budget_s,
+        )
         archive = Archive()
         logger = ExperimentLogger(self._agent_type)
         stats: dict[str, dict[str, Any]] = {}
@@ -1900,6 +1970,7 @@ class AttackAlgorithm(AttackAlgorithmBase):
             f"backend={self._active_experiment_config.backend} "
             f"model={self._active_experiment_config.model_name} "
             f"prompt_profile={self._active_experiment_config.prompt_profile} "
+            f"budget_s={self._active_experiment_config.budget_s:.1f} "
             f"experiment_mode={self._experiment_mode} "
             f"generated_candidate_chains={len(focused_specs) + len(search_plan)} "
             f"focused_probes={'on' if focused_specs else 'off'}",
@@ -2024,8 +2095,10 @@ class AttackAlgorithm(AttackAlgorithmBase):
                     fail_str = " ".join(f"{k}={v}" for k, v in top_failures)
                     print(f"[experiment] {tname} failures: {fail_str}", flush=True)
 
-        experiment_file = _phase52_record_file_path()
-        if _phase52_file_logging_enabled() and os.path.exists(experiment_file):
+        experiment_file = _experiment_record_file_path(self._experiment_mode)
+        if _experiment_file_logging_enabled(
+            self._experiment_mode
+        ) and os.path.exists(experiment_file):
             print(f"[experiment-file] {experiment_file}", flush=True)
 
         return candidates
