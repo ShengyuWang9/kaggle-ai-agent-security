@@ -1,7 +1,7 @@
 """
 AI Agent Security Competition - Attack Submission
 
-Phase 5.2-A: structured experiment logging — ExperimentLogger + failure taxonomy
+Phase 5.6.2: experiment configuration + backend/model metadata
 
   PromptGenerator(profile) → ChainBuilder → execute → TraceAnalyzer → Archive → AttackCandidate
 
@@ -19,11 +19,13 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import os
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Final
 
 from aicomp_sdk.attacks import AttackAlgorithmBase, AttackCandidate, AttackRunConfig
@@ -49,6 +51,158 @@ AGENT_TYPE_ENV_VARS: Final[tuple[str, ...]] = (
 )
 EXPERIMENT_MODE_ENV_VAR: Final[str] = "AICOMP_ATTACK_EXPERIMENT_MODE"
 PHASE52_RECORDS_FILENAME: Final[str] = "phase5_2_records.jsonl"
+EXPERIMENT_BACKEND_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_BACKEND"
+EXPERIMENT_MODEL_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_MODEL"
+EXPERIMENT_AGENT_TYPE_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_AGENT_TYPE"
+EXPERIMENT_PROMPT_PROFILE_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_PROMPT_PROFILE"
+EXPERIMENT_SEED_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_SEED"
+EXPERIMENT_BUDGET_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_BUDGET_S"
+EXPERIMENT_PROBE_SET_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_PROBE_SET"
+EXPERIMENT_ENVIRONMENT_ENV_VAR: Final[str] = "AICOMP_EXPERIMENT_ENVIRONMENT"
+
+
+def _config_probe_set(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        probes = tuple(str(item).strip() for item in value if str(item).strip())
+        return tuple(dict.fromkeys(probes))
+    raise TypeError("experiment probe_set must be a comma-separated string or sequence")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    """Declared experiment metadata, independent from evaluator-owned config.
+
+    ``backend`` and ``model_name`` describe the declared execution target.
+    They are never inferred from ``agent_type`` or ``prompt_profile``.
+    ``budget_s=0`` means that ``AttackRunConfig.time_budget_s`` supplies the
+    runtime value when ``run()`` starts.
+    """
+
+    backend: str = "local"
+    model_name: str = "deterministic"
+    agent_type: str = "deterministic"
+    prompt_profile: str = "deterministic"
+    seed: int = 123
+    budget_s: float = 0.0
+    probe_set: tuple[str, ...] = ()
+    environment: str = "local"
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any] | None) -> "ExperimentConfig":
+        root = dict(config or {})
+        nested_value = root.get("experiment")
+        if nested_value is None:
+            nested: dict[str, Any] = {}
+        elif isinstance(nested_value, Mapping):
+            nested = dict(nested_value)
+        else:
+            raise TypeError("config['experiment'] must be a mapping")
+
+        # A nested experiment mapping is the canonical interface. Flat keys are
+        # accepted to preserve compatibility with existing local callers.
+        declared = dict(root)
+        declared.update(nested)
+
+        def pick(key: str, env_var: str, default: Any = None) -> Any:
+            if key in declared and declared[key] is not None:
+                return declared[key]
+            env_value = os.getenv(env_var)
+            if env_value is not None and env_value.strip():
+                return env_value
+            return default
+
+        agent_type_value = pick("agent_type", EXPERIMENT_AGENT_TYPE_ENV_VAR)
+        if agent_type_value is None:
+            for env_var in AGENT_TYPE_ENV_VARS:
+                env_value = os.getenv(env_var)
+                if env_value and env_value.strip():
+                    agent_type_value = env_value
+                    break
+        agent_type = str(agent_type_value or "deterministic").strip().lower()
+
+        backend = str(
+            pick("backend", EXPERIMENT_BACKEND_ENV_VAR, "local")
+        ).strip().lower() or "local"
+        default_model = (
+            "deterministic"
+            if backend == "local" and agent_type == "deterministic"
+            else "unknown"
+        )
+        model_name = str(
+            pick("model_name", EXPERIMENT_MODEL_ENV_VAR, default_model)
+        ).strip() or "unknown"
+
+        default_profile = "llm" if agent_type in LLM_AGENT_TYPES else "deterministic"
+        prompt_profile = str(
+            pick("prompt_profile", EXPERIMENT_PROMPT_PROFILE_ENV_VAR, default_profile)
+        ).strip().lower()
+        if prompt_profile not in {"deterministic", "llm"}:
+            raise ValueError(
+                "experiment prompt_profile must be 'deterministic' or 'llm'"
+            )
+
+        try:
+            seed = int(pick("seed", EXPERIMENT_SEED_ENV_VAR, 123))
+        except (TypeError, ValueError) as err:
+            raise ValueError("experiment seed must be an integer") from err
+
+        try:
+            budget_s = float(pick("budget_s", EXPERIMENT_BUDGET_ENV_VAR, 0.0))
+        except (TypeError, ValueError) as err:
+            raise ValueError("experiment budget_s must be a number") from err
+        if not math.isfinite(budget_s) or budget_s < 0:
+            raise ValueError("experiment budget_s must be finite and non-negative")
+
+        probe_value = pick("probe_set", EXPERIMENT_PROBE_SET_ENV_VAR)
+        if probe_value is None and "probes" in declared:
+            probe_value = declared["probes"]
+        probe_set = _config_probe_set(probe_value)
+
+        default_environment = "local" if backend == "local" else "unknown"
+        environment = str(
+            pick(
+                "environment",
+                EXPERIMENT_ENVIRONMENT_ENV_VAR,
+                default_environment,
+            )
+        ).strip().lower() or "unknown"
+
+        return cls(
+            backend=backend,
+            model_name=model_name,
+            agent_type=agent_type,
+            prompt_profile=prompt_profile,
+            seed=seed,
+            budget_s=budget_s,
+            probe_set=probe_set,
+            environment=environment,
+        )
+
+    def with_runtime_budget(self, budget_s: float) -> "ExperimentConfig":
+        resolved = float(budget_s)
+        if not math.isfinite(resolved) or resolved <= 0:
+            raise ValueError("runtime budget_s must be finite and greater than zero")
+        return replace(self, budget_s=resolved)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "model_name": self.model_name,
+            "agent_type": self.agent_type,
+            "prompt_profile": self.prompt_profile,
+            "seed": self.seed,
+            "budget_s": self.budget_s,
+            "probe_set": list(self.probe_set),
+            "environment": self.environment,
+        }
 
 
 @dataclass(frozen=True)
@@ -1031,11 +1185,23 @@ def _classify_phase52_failure(
 
 @dataclass
 class ExperimentRecord:
-    """一条链的完整实验记录（Phase 5.1 日志 schema）。"""
+    """One chain result plus explicit Phase 5.6 execution metadata."""
 
     agent_type: str
     template: str
     prompt_chain: tuple[str, ...]
+    timestamp: str = ""
+    backend: str = "unknown"
+    model_name: str = "unknown"
+    prompt_profile: str = "deterministic"
+    seed: int | None = None
+    budget_s: float = 0.0
+    probe_name: str = ""
+    environment: str = "unknown"
+    trace: dict[str, Any] = field(default_factory=dict)
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
+    predicate_result: list[dict[str, Any]] = field(default_factory=list)
+    failure_category: list[str] = field(default_factory=list)
     experiment_id: str = ""
     hypothesis: str = ""
     prompt_hash: str = ""
@@ -1064,7 +1230,19 @@ class ExperimentRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "timestamp": self.timestamp,
+            "backend": self.backend,
+            "model_name": self.model_name,
             "agent_type": self.agent_type,
+            "prompt_profile": self.prompt_profile,
+            "seed": self.seed,
+            "budget_s": self.budget_s,
+            "probe_name": self.probe_name,
+            "environment": self.environment,
+            "trace": self.trace,
+            "tool_events": self.tool_events,
+            "predicate_result": self.predicate_result,
+            "failure_category": self.failure_category,
             "experiment_id": self.experiment_id,
             "hypothesis": self.hypothesis,
             "template": self.template,
@@ -1264,9 +1442,15 @@ class AttackAlgorithm(AttackAlgorithmBase):
     def __init__(self, config: Mapping[str, Any] | None = None):
         super().__init__(config)
         cfg = dict(config or {})
-        self._agent_type = self._resolve_agent_type(cfg)
-        self._uses_llm_profile = self._agent_type in LLM_AGENT_TYPES
-        profile = LLM_PROFILE if self._uses_llm_profile else DETERMINISTIC_PROFILE
+        self._experiment_config = ExperimentConfig.from_mapping(cfg)
+        self._active_experiment_config = self._experiment_config
+        self._agent_type = self._experiment_config.agent_type
+        self._uses_llm_profile = self._experiment_config.prompt_profile == "llm"
+        profile = (
+            LLM_PROFILE
+            if self._experiment_config.prompt_profile == "llm"
+            else DETERMINISTIC_PROFILE
+        )
         default_mode = "search"
         self._experiment_mode = str(
             cfg.get("experiment_mode")
@@ -1277,17 +1461,6 @@ class AttackAlgorithm(AttackAlgorithmBase):
         self.prompt_generator = PromptGenerator(profile=profile)
         self.chain_builder = ChainBuilder()
         self.trace_analyzer = TraceAnalyzer()
-
-    @staticmethod
-    def _resolve_agent_type(cfg: Mapping[str, Any]) -> str:
-        configured = cfg.get("agent_type")
-        if configured:
-            return str(configured).lower()
-        for env_var in AGENT_TYPE_ENV_VARS:
-            value = os.getenv(env_var)
-            if value:
-                return value.lower()
-        return "deterministic"
 
     def _phase52_specs(self) -> tuple[VerificationSpec, ...]:
         if self._experiment_mode == "phase5_2_only":
@@ -1564,8 +1737,24 @@ class AttackAlgorithm(AttackAlgorithmBase):
             experiment_id = ""
             hypothesis = ""
 
+        experiment = self._active_experiment_config
+        trace_seed = trace.get("seed")
+        record_seed = int(trace_seed) if trace_seed is not None else experiment.seed
+        probe_name = experiment_id or name
         return ExperimentRecord(
+            timestamp=_utc_timestamp(),
+            backend=experiment.backend,
+            model_name=experiment.model_name,
             agent_type=self._agent_type,
+            prompt_profile=experiment.prompt_profile,
+            seed=record_seed,
+            budget_s=experiment.budget_s,
+            probe_name=probe_name,
+            environment=experiment.environment,
+            trace=dict(trace),
+            tool_events=[dict(event) for event in events],
+            predicate_result=[dict(predicate) for predicate in analysis.predicates],
+            failure_category=list(failure_reasons),
             experiment_id=experiment_id,
             hypothesis=hypothesis,
             template=name,
@@ -1594,7 +1783,7 @@ class AttackAlgorithm(AttackAlgorithmBase):
                 len(guardrail_blocked),
             ),
             real_attack_impact=_highest_real_attack_impact(analysis),
-            trace_seed=trace.get("seed"),
+            trace_seed=record_seed,
             checks=checks,
         )
 
@@ -1664,8 +1853,19 @@ class AttackAlgorithm(AttackAlgorithmBase):
             self._emit_record(record)
 
         except Exception as err:
+            experiment = self._active_experiment_config
+            failure_category = ["AGENT_CRASH"]
             record = ExperimentRecord(
+                timestamp=_utc_timestamp(),
+                backend=experiment.backend,
+                model_name=experiment.model_name,
                 agent_type=self._agent_type,
+                prompt_profile=experiment.prompt_profile,
+                seed=experiment.seed,
+                budget_s=experiment.budget_s,
+                probe_name=verification.experiment_id if verification else name,
+                environment=experiment.environment,
+                failure_category=failure_category,
                 experiment_id=verification.experiment_id if verification else "",
                 hypothesis=verification.hypothesis if verification else "",
                 template=name,
@@ -1673,14 +1873,18 @@ class AttackAlgorithm(AttackAlgorithmBase):
                 prompt_hash=_prompt_hash(chain),
                 agent_refused_messages=agent_refused_messages,
                 agent_refused_any=agent_refused,
-                failure_reasons=["AGENT_CRASH"],
+                failure_reasons=failure_category,
                 replayable_risk="high",
+                trace_seed=experiment.seed,
                 notes=f"{type(err).__name__}: {str(err)[:160]}",
             )
             logger.log(record)
             self._emit_record(record)
 
     def run(self, env, config: AttackRunConfig) -> list[AttackCandidate]:
+        self._active_experiment_config = self._experiment_config.with_runtime_budget(
+            config.time_budget_s
+        )
         state = AttackState(config)
         archive = Archive()
         logger = ExperimentLogger(self._agent_type)
@@ -1693,6 +1897,9 @@ class AttackAlgorithm(AttackAlgorithmBase):
 
         print(
             f"[attack-mode] agent_type={self._agent_type} "
+            f"backend={self._active_experiment_config.backend} "
+            f"model={self._active_experiment_config.model_name} "
+            f"prompt_profile={self._active_experiment_config.prompt_profile} "
             f"experiment_mode={self._experiment_mode} "
             f"generated_candidate_chains={len(focused_specs) + len(search_plan)} "
             f"focused_probes={'on' if focused_specs else 'off'}",
