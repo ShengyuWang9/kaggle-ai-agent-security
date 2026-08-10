@@ -747,9 +747,10 @@ class JEDAttackGateway(kaggle_evaluation.core.templates.Gateway):
                     deadline_s=generation_deadline_s,
                     phase=f"Model {model_name} generation",
                 )
+                generation_elapsed_s = time.time() - model_t0
 
                 print(f"\n[GATEWAY][{model_name}] Phase 1 complete: "
-                      f"{len(candidates)} candidates in {time.time()-model_t0:.1f}s")
+                      f"{len(candidates)} candidates in {generation_elapsed_s:.1f}s")
 
                 # Phase 2: Replay against each guardrail configuration.
                 model_results: dict[str, Any] = {
@@ -770,15 +771,41 @@ class JEDAttackGateway(kaggle_evaluation.core.templates.Gateway):
                         deadline_s=replay_deadline_s,
                         phase=f"Model {model_name} {guardrail_label} replay",
                     )
-                    row_id = f"{model_name}_{guardrail_label}"
-                    row_scores[row_id] = result["score"]
-                    model_results["guardrail_scores"][guardrail_label] = {
-                        "score": result["score"],
-                        "summary": result["summary"],
-                        "findings_validated": len(result["findings"]),
+                    replay_elapsed_s = time.time() - replay_t0
+                    input_candidates = len(candidates)
+                    validated_findings = len(result["findings"])
+                    score = float(result["score"])
+                    finding_density = (
+                        validated_findings / input_candidates if input_candidates else 0.0
+                    )
+                    score_per_candidate = score / input_candidates if input_candidates else 0.0
+                    replay_minutes = replay_elapsed_s / 60.0
+                    score_per_minute = score / replay_minutes if replay_minutes > 0 else 0.0
+                    metrics = {
+                        "model": model_name,
+                        "guardrail": guardrail_label,
+                        "generated_candidates": input_candidates,
+                        "input_candidates": input_candidates,
+                        "validated_findings": validated_findings,
+                        "finding_density": finding_density,
+                        "score": score,
+                        "score_per_candidate": score_per_candidate,
+                        "score_per_minute": score_per_minute,
+                        "generation_elapsed_s": generation_elapsed_s,
+                        "replay_elapsed_s": replay_elapsed_s,
+                        "total_model_elapsed_s": time.time() - model_t0,
                     }
+                    row_id = f"{model_name}_{guardrail_label}"
+                    row_scores[row_id] = score
+                    model_results["guardrail_scores"][guardrail_label] = {
+                        "score": score,
+                        "summary": result["summary"],
+                        "findings_validated": validated_findings,
+                        "metrics": metrics,
+                    }
+                    print(f"[metrics] {json.dumps(metrics, sort_keys=True)}")
                     print(f"[GATEWAY][{model_name}] {row_id} = {result['score']} "
-                          f"({time.time()-replay_t0:.1f}s)")
+                          f"({replay_elapsed_s:.1f}s)")
 
                 per_model_results[model_name] = model_results
 

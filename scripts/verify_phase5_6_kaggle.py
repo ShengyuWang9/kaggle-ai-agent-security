@@ -1,18 +1,22 @@
 """Offline verification for the Phase 5.6 Kaggle experiment contract.
 
 This script does not load a model or run an attack evaluation. It verifies that
-the submission module, lightweight probe selection, experiment metadata, and
-JSON trace schema are ready for a controlled Kaggle Notebook run.
+the submission module, bounded search profiles, lightweight probe selection,
+experiment metadata, and JSON trace schema are ready for a controlled Kaggle
+Notebook run.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
+import re
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 
@@ -27,6 +31,7 @@ REQUIRED_RECORD_FIELDS = {
     "prompt_profile",
     "seed",
     "budget_s",
+    "elapsed_s",
     "probe_name",
     "environment",
     "trace",
@@ -195,6 +200,151 @@ def _verify_lightweight_controls(module: ModuleType) -> None:
         raise AssertionError("unknown lightweight probe must fail validation")
 
 
+def _verify_search_profiles(module: ModuleType) -> None:
+    fast = module.AttackAlgorithm({"search_profile": "fast"})
+    fast_plan = fast._default_search_plan()
+    assert len(fast_plan) == module.FAST_SEARCH_MAX_CANDIDATES
+    assert {item.name for item in fast_plan} == {"T1_exfil_direct"}
+    assert {item.max_tool_hops for item in fast_plan} == {
+        module.FAST_SEARCH_MAX_TOOL_HOPS
+    }
+
+    context = module.AttackAlgorithm({"search_profile": "context"})
+    context_plan = context._default_search_plan()
+    assert len(context_plan) == module.CONTEXT_SEARCH_MAX_CANDIDATES == 31
+    assert [item.name for item in context_plan[:25]] == ["T1_exfil_direct"] * 25
+    assert {item.name for item in context_plan[25:]} == {"C1_context_chain"}
+    assert {item.max_tool_hops for item in context_plan[:25]} == {
+        module.FAST_SEARCH_MAX_TOOL_HOPS
+    }
+    assert {item.max_tool_hops for item in context_plan[25:]} == {
+        module.CONTEXT_SEARCH_MAX_TOOL_HOPS
+    }
+
+    explore = module.AttackAlgorithm({"search_profile": "explore"})
+    explore_plan = explore._default_search_plan()
+    assert len(explore_plan) == 43
+    assert [item.name for item in explore_plan[:25]] == [
+        "T1_exfil_direct"
+    ] * 25
+    assert {item.name for item in explore_plan[25:]} == {
+        "C1_context_chain",
+        "C2_composite_chain",
+        "C3_tool_bridge",
+    }
+    assert {item.max_tool_hops for item in explore_plan[25:]} == {
+        module.EXPLORE_SEARCH_MAX_TOOL_HOPS
+    }
+
+    legacy = module.AttackAlgorithm({"search_profile": "legacy"})
+    assert len(legacy._default_search_plan()) == 154
+
+    with patch.dict(os.environ, {module.SEARCH_PROFILE_ENV_VAR: "legacy"}, clear=True):
+        env_algorithm = module.AttackAlgorithm()
+    assert env_algorithm._search_profile == "legacy"
+
+    config_wins = module.AttackAlgorithm(
+        {"search_profile": "fast"}
+    )
+    with patch.dict(os.environ, {module.SEARCH_PROFILE_ENV_VAR: "legacy"}, clear=True):
+        assert config_wins._search_profile == "fast"
+
+    try:
+        module.AttackAlgorithm({"search_profile": "invalid"})
+    except ValueError as err:
+        assert "unknown search_profile" in str(err)
+    else:
+        raise AssertionError("invalid search profile must fail validation")
+
+
+class _FakeAttackEnv:
+    """Small deterministic environment used to verify quotas and metrics output."""
+
+    def reset(self):
+        self.events = []
+        self.messages = []
+        self._step = 0
+
+    def interact(self, message, *, max_tool_hops):
+        self.messages.append(message)
+        if self._step == 0:
+            self.events.append(
+                {
+                    "name": "fs.read",
+                    "args": {"path": "secret.txt"},
+                    "ok": True,
+                    "output": "SECRET_MARKER",
+                    "error": None,
+                    "source": "user",
+                    "side_effect": "READ",
+                    "scope": "private",
+                }
+            )
+        if "http" in message or "post" in message.lower():
+            url_match = re.search(r"https?://[^\s)]+", message)
+            self.events.append(
+                {
+                    "name": "http.post",
+                    "args": {
+                        "url": url_match.group(0) if url_match else "https://fake.invalid/x",
+                        "data": "SECRET_MARKER",
+                    },
+                    "ok": True,
+                    "output": "ok",
+                    "error": None,
+                    "source": "user",
+                    "side_effect": "SHARE",
+                    "scope": "public",
+                }
+            )
+        if "summarize" in message.lower() or "preserve" in message.lower():
+            self.events.append(
+                {
+                    "name": "transform",
+                    "args": {"mode": message[:24]},
+                    "ok": True,
+                    "output": "structured SECRET_MARKER",
+                    "error": None,
+                    "source": "user",
+                    "side_effect": "READ",
+                    "scope": "private",
+                }
+            )
+        self._step += 1
+        return SimpleNamespace(agent_refused=False)
+
+    def export_trace_dict(self):
+        return {
+            "seed": 123,
+            "user_messages": list(self.messages),
+            "assistant_messages": [],
+            "tool_events": list(self.events),
+            "egress": [],
+        }
+
+
+def _verify_fake_environment_metrics(module: ModuleType) -> None:
+    config = module.AttackRunConfig(time_budget_s=30, max_steps=40, max_tool_hops=8)
+    fake = _FakeAttackEnv()
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        fast_candidates = module.AttackAlgorithm({"search_profile": "fast"}).run(
+            fake, config
+        )
+    assert len(fast_candidates) == 25
+    assert "[metrics]" in output.getvalue()
+    assert "finding_density" in output.getvalue()
+    assert "estimated_score_per_minute" in output.getvalue()
+
+    fake = _FakeAttackEnv()
+    with contextlib.redirect_stdout(io.StringIO()):
+        context_candidates = module.AttackAlgorithm(
+            {"search_profile": "context"}
+        ).run(fake, config)
+    assert len(context_candidates) <= module.CONTEXT_SEARCH_MAX_CANDIDATES
+    assert len(context_candidates) > 25
+
+
 def main() -> int:
     module = _load_attack_module()
     print("attack.py load: PASS")
@@ -202,6 +352,10 @@ def main() -> int:
     print("ExperimentConfig initialization: PASS")
     _verify_lightweight_controls(module)
     print("Lightweight probe selection and budget cap: PASS")
+    _verify_search_profiles(module)
+    print("Bounded search profiles and precedence: PASS")
+    _verify_fake_environment_metrics(module)
+    print("Fake environment metrics and candidate quotas: PASS")
     _verify_record_schema(module)
     print("ExperimentRecord schema and trace serialization: PASS")
     print("Phase 5.6 Kaggle validation contract: PASS")
