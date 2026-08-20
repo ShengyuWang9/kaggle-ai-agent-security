@@ -346,15 +346,31 @@ class AttackAlgorithm(AttackAlgorithmBase):
                 break
 
         # ---- 阶段 3：全量笛卡尔积盲铺（tier_b 兜底） ----------------------
-        # 不依赖 LLM 探测，纯 CPU 生成，保证候选数充足。约 20% 附带 email。
+        # 不依赖 LLM 探测，纯 CPU 生成，保证候选数充足。
+        # round-robin 交错遍历：每轮给每个域名配一个「轮转错位」的场景，
+        # 使 2000 个候选均匀覆盖全部 55 个场景模板 × 220 个域名（而非只
+        # 命中前 9 个场景），最大化措辞多样性以对冲单一场景的拒答风险。
+        # _stride=7 与 55 互质，保证场景错位在轮次间充分轮转。
+        scenarios = _build_scenarios()
+        n_scen = len(scenarios)
+        _stride = 7
         tier_b: list[str] = []
-        for scenario in _build_scenarios():
-            for i, domain in enumerate(self._domains):
-                with_email = (i % 5 == 0)
+        round_no = 0
+        while len(tier_b) < MAX_REPLAY_FINDINGS:
+            added = 0
+            for di, domain in enumerate(self._domains):
+                if len(tier_b) >= MAX_REPLAY_FINDINGS:
+                    break
+                scenario = scenarios[(di + round_no * _stride) % n_scen]
+                with_email = ((di + round_no) % 5 == 0)  # 约 20% 附带 email
                 prompt = self._builder.build(scenario, domain, with_email=with_email)
                 if prompt in tier_a_seen:
                     continue
                 tier_b.append(prompt)
+                added += 1
+            if added == 0:
+                break
+            round_no += 1
 
         # ---- 阶段 4：合并（tier_a 优先）并截断 -----------------------------
         merged = (tier_a + tier_b)[:MAX_REPLAY_FINDINGS]
