@@ -1,6 +1,5 @@
 # %%writefile /kaggle/working/attack.py
-
-# mark 41.0
+# attack mark: 41.7
 
 from __future__ import annotations
 
@@ -192,20 +191,15 @@ class AttackAlgorithm(AttackAlgorithmBase):
         deadline = time.monotonic() + float(config.time_budget_s)
         time_budget = float(config.time_budget_s)
 
-        # 阶段划分：
-        # - 探测阶段：用少量种子快速找出能触发 predicate 的场景
-        # - 验证阶段：用这些场景跨域名扩展，并实时验证，保留高命中候选
-        # - 兜底阶段：若候选不足，再盲铺少量
-
-        # ---- 阶段1：探测（缩减种子数，提高效率） ----
-        # 只用前 12 个域名，每个场景配一个域名（不加 email），快速扫描
-        probe_domains = self._domains[:12]
+        # ---- 阶段1：探测 ----
+        # 【修改1】探测域名从 12 扩展到 18
+        probe_domains = self._domains[:18]
         scenarios = _build_scenarios()
         successful_scenarios: set[str] = set()
         tier_a: list[str] = []
         tier_a_seen: set[str] = set()
 
-        probe_deadline = deadline - 0.6 * time_budget  # 留给验证阶段 60% 时间
+        probe_deadline = deadline - 0.6 * time_budget
         seed_pool: list[tuple[str, str]] = []
         for scenario in scenarios:
             for domain in probe_domains:
@@ -230,27 +224,25 @@ class AttackAlgorithm(AttackAlgorithmBase):
                     tier_a_seen.add(prompt)
                 successful_scenarios.add(scenario)
 
-        print(f"[probe] tried {tries} seeds, found {len(successful_scenarios)} successful scenarios")
+        print(f"[probe] tried {tries} seeds, found {len(successful_scenarios)} successful scenarios", flush=True)
 
-        # ---- 阶段2：验证扩展（核心优化） ----
-        # 使用成功场景 × 前 80 个域名，实时验证，只保留触发 predicate 的候选
-        validated_prompts: list[str] = list(tier_a)  # 探测阶段已验证的保留
+        # ---- 阶段2：验证扩展 ----
+        validated_prompts: list[str] = list(tier_a)
         validated_seen = set(tier_a_seen)
-        MAX_VALIDATED = 700  # 硬上限，防止超时
+        # 【修改2】候选上限从 700 提升到 850
+        MAX_VALIDATED = 850
 
-        # 优先用成功场景扩展
         for scenario in sorted(successful_scenarios):
             if len(validated_prompts) >= MAX_VALIDATED:
                 break
-            for domain in self._domains[:80]:  # 只用前 80 个域名
+            for domain in self._domains[:80]:
                 if len(validated_prompts) >= MAX_VALIDATED:
                     break
-                # 约 10% 的概率附带 email 副指令（捡漏 CONFUSED_DEPUTY）
-                with_email = (self._rng.random() < 0.10)
+                # 【修改3】email 概率从 0.10 提升到 0.15
+                with_email = (self._rng.random() < 0.15)
                 prompt = self._builder.build(scenario, domain, with_email=with_email)
                 if prompt in validated_seen:
                     continue
-                # 实时验证
                 try:
                     env.reset()
                     env.interact(prompt, max_tool_hops=config.max_tool_hops)
@@ -260,11 +252,10 @@ class AttackAlgorithm(AttackAlgorithmBase):
                 except Exception:
                     continue
 
-        print(f"[verify] validated {len(validated_prompts)} prompts so far")
+        print(f"[verify] validated {len(validated_prompts)} prompts so far", flush=True)
 
-        # ---- 阶段3：兜底盲铺（如果候选不足 300，补到 500） ----
+        # ---- 阶段3：兜底盲铺 ----
         if len(validated_prompts) < 300:
-            # 用所有场景和域名盲铺，但只补到 500 且不加验证（节省时间）
             for scenario in scenarios[:30]:
                 for domain in self._domains[:40]:
                     if len(validated_prompts) >= 500:
