@@ -398,6 +398,7 @@ class AttackAlgorithm(AttackAlgorithmBase):
         stats: dict[str, FamilyStats] = {s: FamilyStats(scenario=s) for s in scenarios}
         bank: list[str] = []        # 已验证成功的候选（prompt）
         bank_seen: set[str] = set()
+        bank_elapsed: list[float] = []  # 与 bank 平行的实测耗时（用于未来 replay liability 估算）
 
         probe_hosts = [_unique_host(i) for i in range(18)]
         probe_deadline = deadline - 0.6 * time_budget
@@ -431,6 +432,7 @@ class AttackAlgorithm(AttackAlgorithmBase):
                     if prompt not in bank_seen:
                         bank.append(prompt)
                         bank_seen.add(prompt)
+                        bank_elapsed.append(elapsed)
             except Exception:
                 continue
 
@@ -439,6 +441,11 @@ class AttackAlgorithm(AttackAlgorithmBase):
         # ---- Phase 1.5：family utility ranking（含 predicate 覆盖保底）----
         validated_prompts: list[str] = list(bank)
         validated_seen: set[str] = set(bank_seen)
+        # Estimated future evaluator replay liability for all validated candidates.
+        # bank 候选虽已在 probe 阶段跑过一次（那份 wall-clock 由 deadline 自然承担），
+        # 但它们进入返回集后仍会在 evaluator 评分阶段被 replay 一次；用 probe 实测
+        # 耗时作为这份「未来 replay liability」的估计，计入 replay_cost 初始值。
+        replay_cost = sum(bank_elapsed)
 
         # 已触发过的目标 predicate 并集（用于 predicate 覆盖保底：鼓励探索尚未
         # 覆盖的 predicate，避免单一高收益 family 挤掉多样性）。probe 阶段 bank
