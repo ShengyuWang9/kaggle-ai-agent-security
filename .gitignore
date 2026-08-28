@@ -31,3 +31,8 @@ evaluation_artifacts/
 
 # Temporary files
 *.log
+
+# highMark (local experiments, do not commit)
+highMark/
+
+.highMark
