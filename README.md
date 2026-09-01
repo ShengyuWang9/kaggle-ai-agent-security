@@ -81,8 +81,18 @@ Use Python 3.12:
 python -m venv .venv
 source .venv/bin/activate  # use the equivalent activation command on Windows
 python -m pip install -r requirements.txt
-export PYTHONPATH="$PWD/data"  # PowerShell: $env:PYTHONPATH = "$PWD\\data"
+export PYTHONPATH="$PWD/data"
+```
 
+PowerShell:
+
+```powershell
+$env:PYTHONPATH = "$PWD\data"
+```
+
+Validate and test:
+
+```bash
 python -m aicomp_sdk.cli.main validate redteam attack.py
 python -m aicomp_sdk.cli.main test redteam attack.py
 ```
