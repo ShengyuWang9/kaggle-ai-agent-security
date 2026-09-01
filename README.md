@@ -52,7 +52,7 @@ The SDK package is located at `data/aicomp_sdk`. Add `data` to `PYTHONPATH`.
 Windows PowerShell:
 
 ```powershell
-$env:PYTHONPATH = "$PWD\data"
+$env:PYTHONPATH = "$PWD\\data"
 ```
 
 macOS/Linux/WSL:
